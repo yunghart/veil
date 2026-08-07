@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+veil --version
+veil --help >/dev/null

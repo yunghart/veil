@@ -1,0 +1,30 @@
+Source: veil-im
+Section: net
+Priority: optional
+Maintainer: Veil IM contributors <maintainers@example.invalid>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-sequence-python3,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-setuptools,
+ python3-wheel
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: veil-im
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ python3-argon2,
+ python3-cryptography,
+ python3-platformdirs,
+ python3-prompt-toolkit,
+ python3-stem,
+ tor
+Description: experimental encrypted terminal messenger over Tor
+ Veil IM creates a terminal-based one-to-one messaging session using Tor v3
+ onion services, authenticated application identities, and encrypted frames.
+ .
+ This package is an unaudited alpha and is not suitable for high-risk use.

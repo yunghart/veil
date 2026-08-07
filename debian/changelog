@@ -1,0 +1,13 @@
+veil-im (0.1.1-1) unstable; urgency=medium
+
+  * Refresh the terminal UI with an ASCII VEIL masthead.
+  * Add a live node sidebar for identity, Tor route, session, and memory status.
+  * Normalize session log prefixes and add a dedicated veil> command prompt.
+
+ -- Veil IM contributors <maintainers@example.invalid>  Fri, 07 Aug 2026 03:36:00 +0200
+
+veil-im (0.1.0-1) unstable; urgency=medium
+
+  * Initial experimental release.
+
+ -- Veil IM contributors <maintainers@example.invalid>  Fri, 07 Aug 2026 01:55:00 +0200

@@ -1,3 +1,13 @@
+veil-im (0.2.0-1) unstable; urgency=medium
+
+  * Replace the custom v1 handshake with Noise XX over 25519/ChaChaPoly/SHA256.
+  * Bind Ed25519 identities to Noise keys and onion endpoints.
+  * Add strict framing, periodic transport rekeying, and padded application events.
+  * Add deterministic vectors, fuzz harnesses, and Tor/runtime hardening.
+  * Add unread session state, QR invite output, and release provenance tooling.
+
+ -- Veil IM contributors <maintainers@example.invalid>  Fri, 07 Aug 2026 21:47:00 +0200
+
 veil-im (0.1.1-1) unstable; urgency=medium
 
   * Refresh the terminal UI with an ASCII VEIL masthead.

@@ -80,6 +80,8 @@ class NetworkNode:
         socks_port: int = 9050,
         virtual_port: int = 9736,
         approval_timeout: float = 120.0,
+        handshake_timeout: float = 45.0,
+        max_pending_approvals: int = 8,
     ) -> None:
         self.vault = vault
         self.identity: Identity = vault.identity
@@ -87,6 +89,8 @@ class NetworkNode:
         self.socks_port = socks_port
         self.virtual_port = virtual_port
         self.approval_timeout = approval_timeout
+        self.handshake_timeout = handshake_timeout
+        self.max_pending_approvals = max_pending_approvals
         self.onion: str | None = None
         self.events: asyncio.Queue[NodeEvent] = asyncio.Queue()
         self._server: asyncio.AbstractServer | None = None
@@ -132,6 +136,9 @@ class NetworkNode:
     async def _authorize(self, peer: PeerInfo) -> bool:
         if self._known_contact(peer) is not None:
             return True
+        if len(self._pending) >= self.max_pending_approvals:
+            await self.events.put(StatusEvent("incoming approval queue is full; peer rejected"))
+            return False
         loop = asyncio.get_running_loop()
         request_id = secrets.token_hex(3)
         while request_id in self._pending:
@@ -166,8 +173,9 @@ class NetworkNode:
             return
         session: SecureSession | None = None
         try:
-            session = await server_handshake(
-                reader, writer, self.identity, self.onion, self._authorize
+            session = await asyncio.wait_for(
+                server_handshake(reader, writer, self.identity, self.onion, self._authorize),
+                timeout=self.handshake_timeout + self.approval_timeout,
             )
             await self._register_session(session, inbound=True)
         except PeerRejected:
@@ -191,8 +199,9 @@ class NetworkNode:
             self.virtual_port,
         )
         try:
-            session = await client_handshake(
-                reader, writer, self.identity, self.onion, invite
+            session = await asyncio.wait_for(
+                client_handshake(reader, writer, self.identity, self.onion, invite),
+                timeout=self.handshake_timeout + self.approval_timeout,
             )
         except Exception:
             writer.close()

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 from .crypto import fingerprint
-from .util import b64u_decode, b64u_encode, canonical_json, validate_onion, validate_username
+from .util import (
+    b64u_decode,
+    b64u_encode,
+    canonical_json,
+    strict_json_loads,
+    validate_onion,
+    validate_username,
+)
 
 PREFIX = "veil1:"
 
@@ -46,7 +52,7 @@ class Invite:
         if len(raw) > 2048:
             raise ValueError("invite is too large")
         try:
-            payload = json.loads(raw.decode("utf-8"))
+            payload = strict_json_loads(raw)
         except Exception as exc:
             raise ValueError("invalid invite payload") from exc
         if not isinstance(payload, dict):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -10,7 +9,13 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from .crypto import KDFParams, derive_passphrase_key
 from .models import VaultData
-from .util import atomic_write_private, b64u_decode, b64u_encode, canonical_json
+from .util import (
+    atomic_write_private,
+    b64u_decode,
+    b64u_encode,
+    canonical_json,
+    strict_json_loads,
+)
 
 VAULT_FORMAT = "veil-vault-v1"
 VAULT_AAD = b"veil-im/vault/v1"
@@ -55,7 +60,7 @@ def encrypt_vault(
 
 def decrypt_vault(blob: bytes, passphrase: str) -> VaultData:
     try:
-        envelope: dict[str, Any] = json.loads(blob.decode("utf-8"))
+        envelope: dict[str, Any] = strict_json_loads(blob)
         if envelope.get("format") != VAULT_FORMAT:
             raise VaultError("unsupported vault format")
         if envelope.get("kdf") != "argon2id":
@@ -70,7 +75,7 @@ def decrypt_vault(blob: bytes, passphrase: str) -> VaultData:
             raise VaultError("invalid vault nonce")
         key = derive_passphrase_key(passphrase, salt, params)
         plaintext = ChaCha20Poly1305(key).decrypt(nonce, ciphertext, VAULT_AAD)
-        decoded = json.loads(plaintext.decode("utf-8"))
+        decoded = strict_json_loads(plaintext)
         return VaultData.from_dict(decoded)
     except InvalidTag as exc:
         raise VaultUnlockError("wrong passphrase or damaged vault") from exc

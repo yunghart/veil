@@ -1,45 +1,51 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import os
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from cryptography.exceptions import InvalidSignature, InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.exceptions import InvalidSignature
 
 from .crypto import (
-    derive_session_keys,
     ed25519_public_bytes,
     fingerprint,
-    generate_x25519,
-    sign,
-    verify,
+    sign_identity_binding,
+    verify_identity_binding,
 )
+from .framing import FrameError, read_frame, write_frame
 from .invite import Invite
 from .models import Identity
-from .util import b64u_decode, b64u_encode, canonical_json, validate_onion, validate_username
+from .noise import NoiseError, NoiseSplit, NoiseXX
+from .util import (
+    b64u_decode,
+    b64u_encode,
+    canonical_json,
+    strict_json_loads,
+    validate_onion,
+    validate_username,
+)
 
-PROTOCOL_VERSION = 1
-MAX_FRAME = 64 * 1024
+PROTOCOL_VERSION = 2
+NOISE_PROLOGUE = b"veil-im/v2/noise-xx"
 MAX_MESSAGE_BYTES = 8 * 1024
-HELLO_FIELDS = {
+MAX_EVENT_BYTES = 12 * 1024
+PADDING_BUCKETS = (256, 512, 1024, 2048, 4096, 8192, 16384)
+REKEY_INTERVAL = 1024
+
+IDENTITY_REQUIRED_FIELDS = {
     "type",
     "v",
     "role",
     "username",
     "identity_key",
-    "ephemeral_key",
-    "nonce",
+    "noise_static_key",
     "source_onion",
     "target_onion",
-    "timestamp",
+    "signature",
 }
-RESPONDER_EXTRA_FIELDS = {"peer_hello_hash"}
 
 
 class ProtocolError(Exception):
@@ -68,159 +74,204 @@ class ReceivedMessage:
     timestamp: int
 
 
-async def _read_frame(reader: asyncio.StreamReader) -> bytes:
+def _encode_padded_event(event: dict[str, Any], *, random_bytes=os.urandom) -> bytes:
+    raw = canonical_json(event)
+    if len(raw) > MAX_EVENT_BYTES:
+        raise ProtocolError("encrypted event is too large")
+    needed = 2 + len(raw)
+    bucket = next((size for size in PADDING_BUCKETS if size >= needed), None)
+    if bucket is None:
+        raise ProtocolError("encrypted event exceeds padding buckets")
+    padding_len = bucket - needed
+    return len(raw).to_bytes(2, "big") + raw + random_bytes(padding_len)
+
+
+def _decode_padded_event(plaintext: bytes) -> dict[str, Any]:
+    if len(plaintext) < 2:
+        raise ProtocolError("truncated encrypted event")
+    length = int.from_bytes(plaintext[:2], "big")
+    if length < 2 or length > MAX_EVENT_BYTES or length > len(plaintext) - 2:
+        raise ProtocolError("invalid encrypted event length")
+    raw = plaintext[2 : 2 + length]
     try:
-        header = await reader.readexactly(4)
-    except asyncio.IncompleteReadError as exc:
-        raise ProtocolError("peer closed the connection") from exc
-    length = int.from_bytes(header, "big")
-    if length < 1 or length > MAX_FRAME:
-        raise ProtocolError("invalid frame length")
-    try:
-        return await reader.readexactly(length)
-    except asyncio.IncompleteReadError as exc:
-        raise ProtocolError("truncated frame") from exc
-
-
-async def _write_frame(writer: asyncio.StreamWriter, payload: bytes) -> None:
-    if not payload or len(payload) > MAX_FRAME:
-        raise ProtocolError("invalid outgoing frame length")
-    writer.write(len(payload).to_bytes(4, "big") + payload)
-    await writer.drain()
-
-
-async def _read_json_frame(reader: asyncio.StreamReader) -> dict[str, Any]:
-    raw = await _read_frame(reader)
-    try:
-        value = json.loads(raw.decode("utf-8"))
+        event = strict_json_loads(raw)
     except Exception as exc:
-        raise ProtocolError("invalid JSON frame") from exc
-    if not isinstance(value, dict):
-        raise ProtocolError("protocol frame must be an object")
-    return value
+        raise ProtocolError("invalid encrypted event") from exc
+    if not isinstance(event, dict):
+        raise ProtocolError("encrypted event must be an object")
+    return event
 
 
-async def _write_json_frame(writer: asyncio.StreamWriter, value: dict[str, Any]) -> None:
-    await _write_frame(writer, canonical_json(value))
 
 
-def _hash_transcript(first: dict[str, Any], second: dict[str, Any]) -> bytes:
-    first_raw = canonical_json(first)
-    second_raw = canonical_json(second)
-    encoded = (
-        len(first_raw).to_bytes(4, "big")
-        + first_raw
-        + len(second_raw).to_bytes(4, "big")
-        + second_raw
+def _initial_payload(local_onion: str, target_onion: str) -> bytes:
+    return canonical_json(
+        {
+            "type": "init",
+            "v": PROTOCOL_VERSION,
+            "source_onion": validate_onion(local_onion),
+            "target_onion": validate_onion(target_onion),
+        }
     )
-    return hashlib.sha256(encoded).digest()
 
 
-def _signed_hello(identity: Identity, payload: dict[str, Any]) -> dict[str, Any]:
-    return payload | {"signature": b64u_encode(sign(identity.signing_private, canonical_json(payload)))}
-
-
-def _verify_hello(frame: dict[str, Any], expected_role: str) -> tuple[dict[str, Any], PeerInfo, bytes]:
-    if "signature" not in frame:
-        raise ProtocolError("unsigned hello")
-    payload = {key: value for key, value in frame.items() if key != "signature"}
-    expected_fields = HELLO_FIELDS | (RESPONDER_EXTRA_FIELDS if expected_role == "responder" else set())
-    if set(payload) != expected_fields:
-        raise ProtocolError("hello has missing or unexpected fields")
-    if payload.get("type") != "hello" or int(payload.get("v", -1)) != PROTOCOL_VERSION:
-        raise ProtocolError("unsupported protocol version")
-    if payload.get("role") != expected_role:
-        raise ProtocolError("unexpected handshake role")
-
+def _verify_initial_payload(raw: bytes, *, expected_target_onion: str) -> str:
     try:
-        username = validate_username(str(payload["username"]))
-        source_onion = validate_onion(str(payload["source_onion"]))
-        validate_onion(str(payload["target_onion"]))
-        identity_key = b64u_decode(str(payload["identity_key"]))
-        ephemeral_key = b64u_decode(str(payload["ephemeral_key"]))
-        nonce = b64u_decode(str(payload["nonce"]))
-        signature = b64u_decode(str(frame["signature"]))
-        timestamp = int(payload["timestamp"])
+        value = strict_json_loads(raw)
     except Exception as exc:
-        raise ProtocolError("invalid hello field") from exc
-
-    if len(identity_key) != 32 or len(ephemeral_key) != 32 or len(nonce) != 16:
-        raise ProtocolError("invalid handshake key or nonce length")
-    if timestamp < 0:
-        raise ProtocolError("invalid handshake timestamp")
+        raise ProtocolError("invalid Noise XX initial payload") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "type", "v", "source_onion", "target_onion"
+    }:
+        raise ProtocolError("invalid Noise XX initial payload fields")
     try:
-        verify(identity_key, canonical_json(payload), signature)
-    except (InvalidSignature, ValueError) as exc:
-        raise ProtocolError("invalid handshake signature") from exc
+        if value["type"] != "init" or int(value["v"]) != PROTOCOL_VERSION:
+            raise ValueError("wrong init version")
+        source = validate_onion(str(value["source_onion"]))
+        target = validate_onion(str(value["target_onion"]))
+    except Exception as exc:
+        raise ProtocolError("invalid Noise XX initial payload value") from exc
+    if target != validate_onion(expected_target_onion):
+        raise ProtocolError("connection targeted a different onion endpoint")
+    return source
 
-    return payload, PeerInfo(username, source_onion, identity_key), ephemeral_key
+
+def _identity_binding(
+    identity: Identity,
+    *,
+    role: str,
+    local_onion: str,
+    target_onion: str,
+    noise_static_key: bytes,
+) -> bytes:
+    if role not in {"initiator", "responder"}:
+        raise ValueError("invalid identity binding role")
+    payload: dict[str, Any] = {
+        "type": "identity",
+        "v": PROTOCOL_VERSION,
+        "role": role,
+        "username": identity.username,
+        "identity_key": b64u_encode(ed25519_public_bytes(identity.signing_private)),
+        "noise_static_key": b64u_encode(noise_static_key),
+        "source_onion": validate_onion(local_onion),
+        "target_onion": validate_onion(target_onion),
+    }
+    signature = sign_identity_binding(identity.signing_private, canonical_json(payload))
+    return canonical_json(payload | {"signature": b64u_encode(signature)})
+
+
+def _verify_identity_binding(
+    raw: bytes,
+    *,
+    expected_role: str,
+    expected_noise_static: bytes,
+    expected_source_onion: str | None = None,
+    expected_target_onion: str | None = None,
+    expected_identity_key: bytes | None = None,
+) -> PeerInfo:
+    try:
+        decoded = strict_json_loads(raw)
+    except Exception as exc:
+        raise ProtocolError("invalid encrypted identity payload") from exc
+    if not isinstance(decoded, dict) or not IDENTITY_REQUIRED_FIELDS.issubset(decoded):
+        raise ProtocolError("identity payload has missing fields")
+
+    try:
+        if decoded["type"] != "identity" or int(decoded["v"]) != PROTOCOL_VERSION:
+            raise ValueError("wrong identity payload version")
+        if decoded["role"] != expected_role:
+            raise ValueError("wrong identity role")
+        username = validate_username(str(decoded["username"]))
+        source_onion = validate_onion(str(decoded["source_onion"]))
+        target_onion = validate_onion(str(decoded["target_onion"]))
+        identity_key = b64u_decode(str(decoded["identity_key"]))
+        noise_static_key = b64u_decode(str(decoded["noise_static_key"]))
+        signature = b64u_decode(str(decoded["signature"]))
+    except Exception as exc:
+        raise ProtocolError("invalid identity payload field") from exc
+
+    if len(identity_key) != 32 or len(noise_static_key) != 32 or len(signature) != 64:
+        raise ProtocolError("invalid identity key or signature length")
+    if noise_static_key != expected_noise_static:
+        raise ProtocolError("identity signature is not bound to the Noise static key")
+    if expected_source_onion is not None and source_onion != validate_onion(expected_source_onion):
+        raise ProtocolError("peer onion does not match expected endpoint")
+    if expected_target_onion is not None and target_onion != validate_onion(expected_target_onion):
+        raise ProtocolError("peer targeted a different onion endpoint")
+    if expected_identity_key is not None and identity_key != expected_identity_key:
+        raise ProtocolError("peer identity does not match invite")
+
+    unsigned = {key: value for key, value in decoded.items() if key != "signature"}
+    try:
+        verify_identity_binding(identity_key, canonical_json(unsigned), signature)
+    except (InvalidSignature, ValueError) as exc:
+        raise ProtocolError("invalid identity binding signature") from exc
+
+    return PeerInfo(username=username, onion=source_onion, identity_key=identity_key)
 
 
 class SecureSession:
-    """An ordered, transcript-bound AEAD channel over one TCP stream."""
+    """Ordered Noise transport channel with padding and automatic Noise REKEY()."""
 
     def __init__(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         peer: PeerInfo,
-        send_key: bytes,
-        recv_key: bytes,
-        transcript_hash: bytes,
-        send_label: bytes,
-        recv_label: bytes,
+        split: NoiseSplit,
+        *,
+        rekey_interval: int = REKEY_INTERVAL,
     ) -> None:
+        if rekey_interval < 1:
+            raise ValueError("rekey interval must be positive")
         self.reader = reader
         self.writer = writer
         self.peer = peer
-        self._send_cipher = ChaCha20Poly1305(send_key)
-        self._recv_cipher = ChaCha20Poly1305(recv_key)
-        self._transcript_hash = transcript_hash
-        self._send_label = send_label
-        self._recv_label = recv_label
-        self._send_counter = 0
-        self._recv_counter = 0
+        self._send_cipher = split.send
+        self._recv_cipher = split.receive
+        self._handshake_hash = split.handshake_hash
+        self._send_count = 0
+        self._recv_count = 0
+        self._rekey_interval = rekey_interval
         self._send_lock = asyncio.Lock()
+        self._recv_lock = asyncio.Lock()
         self._closed = False
 
-    @staticmethod
-    def _nonce(label: bytes, counter: int) -> bytes:
-        if len(label) != 4:
-            raise ValueError("direction label must be four bytes")
-        if counter < 0 or counter >= 2**64:
-            raise ProtocolError("session nonce space exhausted")
-        return label + counter.to_bytes(8, "big")
+    @property
+    def channel_binding(self) -> str:
+        return self._handshake_hash.hex()
 
-    def _aad(self, label: bytes) -> bytes:
-        return b"veil-im/frame/v1\x00" + self._transcript_hash + label
+    @property
+    def send_count(self) -> int:
+        return self._send_count
+
+    @property
+    def receive_count(self) -> int:
+        return self._recv_count
 
     async def send_event(self, event: dict[str, Any]) -> None:
-        plaintext = canonical_json(event)
-        if len(plaintext) > MAX_MESSAGE_BYTES + 1024:
-            raise ProtocolError("message event is too large")
+        plaintext = _encode_padded_event(event)
         async with self._send_lock:
-            nonce = self._nonce(self._send_label, self._send_counter)
-            ciphertext = self._send_cipher.encrypt(nonce, plaintext, self._aad(self._send_label))
-            await _write_frame(self.writer, ciphertext)
-            self._send_counter += 1
+            try:
+                ciphertext = self._send_cipher.encrypt_with_ad(b"", plaintext)
+                await write_frame(self.writer, ciphertext)
+            except (NoiseError, FrameError) as exc:
+                raise ProtocolError(str(exc)) from exc
+            self._send_count += 1
+            if self._send_count % self._rekey_interval == 0:
+                self._send_cipher.rekey()
 
     async def receive_event(self) -> dict[str, Any]:
-        ciphertext = await _read_frame(self.reader)
-        nonce = self._nonce(self._recv_label, self._recv_counter)
-        try:
-            plaintext = self._recv_cipher.decrypt(
-                nonce, ciphertext, self._aad(self._recv_label)
-            )
-        except InvalidTag as exc:
-            raise ProtocolError("message authentication failed") from exc
-        self._recv_counter += 1
-        try:
-            event = json.loads(plaintext.decode("utf-8"))
-        except Exception as exc:
-            raise ProtocolError("invalid encrypted message") from exc
-        if not isinstance(event, dict):
-            raise ProtocolError("encrypted event must be an object")
-        return event
+        async with self._recv_lock:
+            try:
+                ciphertext = await read_frame(self.reader)
+                plaintext = self._recv_cipher.decrypt_with_ad(b"", ciphertext)
+            except (NoiseError, FrameError) as exc:
+                raise ProtocolError(str(exc)) from exc
+            self._recv_count += 1
+            if self._recv_count % self._rekey_interval == 0:
+                self._recv_cipher.rekey()
+        return _decode_padded_event(plaintext)
 
     async def send_chat(self, body: str) -> str:
         body = body.strip()
@@ -249,6 +300,8 @@ class SecureSession:
             body = str(event["body"])
         except Exception as exc:
             raise ProtocolError("invalid chat message fields") from exc
+        if timestamp < 0:
+            raise ProtocolError("invalid chat timestamp")
         if len(body.encode("utf-8")) > MAX_MESSAGE_BYTES:
             raise ProtocolError("received message is too large")
         return ReceivedMessage(message_id, body, timestamp)
@@ -257,6 +310,8 @@ class SecureSession:
         if self._closed:
             return
         self._closed = True
+        self._send_cipher.destroy()
+        self._recv_cipher.destroy()
         self.writer.close()
         try:
             await self.writer.wait_closed()
@@ -267,6 +322,20 @@ class SecureSession:
 AuthorizeCallback = Callable[[PeerInfo], Awaitable[bool]]
 
 
+async def _read_noise_frame(reader: asyncio.StreamReader) -> bytes:
+    try:
+        return await read_frame(reader)
+    except FrameError as exc:
+        raise ProtocolError(str(exc)) from exc
+
+
+async def _write_noise_frame(writer: asyncio.StreamWriter, payload: bytes) -> None:
+    try:
+        await write_frame(writer, payload)
+    except FrameError as exc:
+        raise ProtocolError(str(exc)) from exc
+
+
 async def client_handshake(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -275,52 +344,43 @@ async def client_handshake(
     expected: Invite,
 ) -> SecureSession:
     local_onion = validate_onion(local_onion)
-    ephemeral_private, ephemeral_public = generate_x25519()
-    payload = {
-        "type": "hello",
-        "v": PROTOCOL_VERSION,
-        "role": "initiator",
-        "username": identity.username,
-        "identity_key": b64u_encode(ed25519_public_bytes(identity.signing_private)),
-        "ephemeral_key": b64u_encode(ephemeral_public),
-        "nonce": b64u_encode(os.urandom(16)),
-        "source_onion": local_onion,
-        "target_onion": expected.onion,
-        "timestamp": int(time.time()),
-    }
-    client_frame = _signed_hello(identity, payload)
-    await _write_json_frame(writer, client_frame)
+    expected_onion = validate_onion(expected.onion)
+    noise = NoiseXX(initiator=True, prologue=NOISE_PROLOGUE)
+    try:
+        await _write_noise_frame(
+            writer, noise.write_message1(_initial_payload(local_onion, expected_onion))
+        )
+        responder_payload = noise.read_message2(await _read_noise_frame(reader))
+        if noise.rs is None:
+            raise ProtocolError("Noise responder static key is missing")
+        peer = _verify_identity_binding(
+            responder_payload,
+            expected_role="responder",
+            expected_noise_static=noise.rs,
+            expected_source_onion=expected_onion,
+            expected_target_onion=local_onion,
+            expected_identity_key=expected.identity_key,
+        )
 
-    response = await _read_json_frame(reader)
-    if response.get("type") == "error":
-        message = str(response.get("message", "connection rejected"))
-        if response.get("code") == "rejected":
-            raise PeerRejected(message)
-        raise ProtocolError(message)
-
-    server_payload, peer, server_ephemeral = _verify_hello(response, "responder")
-    if peer.identity_key != expected.identity_key:
-        raise ProtocolError("responder identity does not match invite")
-    if peer.onion != expected.onion:
-        raise ProtocolError("responder onion does not match invite")
-    if server_payload["target_onion"] != local_onion:
-        raise ProtocolError("responder did not bind the reply to our onion")
-    client_hash = hashlib.sha256(canonical_json(client_frame)).hexdigest()
-    if server_payload["peer_hello_hash"] != client_hash:
-        raise ProtocolError("responder transcript binding is invalid")
-
-    transcript_hash = _hash_transcript(client_frame, response)
-    first, second = derive_session_keys(ephemeral_private, server_ephemeral, transcript_hash)
-    return SecureSession(
-        reader,
-        writer,
-        peer,
-        send_key=first,
-        recv_key=second,
-        transcript_hash=transcript_hash,
-        send_label=b"CLNT",
-        recv_label=b"SRVR",
-    )
+        initiator_payload = _identity_binding(
+            identity,
+            role="initiator",
+            local_onion=local_onion,
+            target_onion=expected_onion,
+            noise_static_key=noise.static_public,
+        )
+        await _write_noise_frame(writer, noise.write_message3(initiator_payload))
+        session = SecureSession(reader, writer, peer, noise.split())
+        auth = await session.receive_event()
+        if set(auth) != {"type", "status"} or auth.get("type") != "authorization":
+            await session.close()
+            raise ProtocolError("invalid peer authorization response")
+        if auth.get("status") != "accepted":
+            await session.close()
+            raise PeerRejected("peer rejected the connection")
+        return session
+    except (NoiseError, FrameError) as exc:
+        raise ProtocolError(str(exc)) from exc
 
 
 async def server_handshake(
@@ -331,44 +391,40 @@ async def server_handshake(
     authorize: AuthorizeCallback,
 ) -> SecureSession:
     local_onion = validate_onion(local_onion)
-    client_frame = await _read_json_frame(reader)
-    client_payload, peer, client_ephemeral = _verify_hello(client_frame, "initiator")
-    if client_payload["target_onion"] != local_onion:
-        raise ProtocolError("initiator targeted a different onion service")
-
-    if not await authorize(peer):
-        await _write_json_frame(
-            writer,
-            {"type": "error", "code": "rejected", "message": "peer rejected the request"},
+    noise = NoiseXX(initiator=False, prologue=NOISE_PROLOGUE)
+    try:
+        first_payload = noise.read_message1(await _read_noise_frame(reader))
+        initiator_onion = _verify_initial_payload(
+            first_payload, expected_target_onion=local_onion
         )
-        raise PeerRejected("incoming peer rejected")
 
-    ephemeral_private, ephemeral_public = generate_x25519()
-    payload = {
-        "type": "hello",
-        "v": PROTOCOL_VERSION,
-        "role": "responder",
-        "username": identity.username,
-        "identity_key": b64u_encode(ed25519_public_bytes(identity.signing_private)),
-        "ephemeral_key": b64u_encode(ephemeral_public),
-        "nonce": b64u_encode(os.urandom(16)),
-        "source_onion": local_onion,
-        "target_onion": peer.onion,
-        "timestamp": int(time.time()),
-        "peer_hello_hash": hashlib.sha256(canonical_json(client_frame)).hexdigest(),
-    }
-    server_frame = _signed_hello(identity, payload)
-    await _write_json_frame(writer, server_frame)
+        responder_payload = _identity_binding(
+            identity,
+            role="responder",
+            local_onion=local_onion,
+            target_onion=initiator_onion,
+            noise_static_key=noise.static_public,
+        )
+        await _write_noise_frame(writer, noise.write_message2(responder_payload))
 
-    transcript_hash = _hash_transcript(client_frame, server_frame)
-    first, second = derive_session_keys(ephemeral_private, client_ephemeral, transcript_hash)
-    return SecureSession(
-        reader,
-        writer,
-        peer,
-        send_key=second,
-        recv_key=first,
-        transcript_hash=transcript_hash,
-        send_label=b"SRVR",
-        recv_label=b"CLNT",
-    )
+        initiator_payload = noise.read_message3(await _read_noise_frame(reader))
+        split = noise.split()
+        peer = _verify_identity_binding(
+            initiator_payload,
+            expected_role="initiator",
+            expected_noise_static=split.remote_static,
+            expected_source_onion=initiator_onion,
+            expected_target_onion=local_onion,
+        )
+
+        session = SecureSession(reader, writer, peer, split)
+        accepted = await authorize(peer)
+        await session.send_event(
+            {"type": "authorization", "status": "accepted" if accepted else "rejected"}
+        )
+        if not accepted:
+            await session.close()
+            raise PeerRejected("incoming peer was rejected")
+        return session
+    except (NoiseError, FrameError) as exc:
+        raise ProtocolError(str(exc)) from exc

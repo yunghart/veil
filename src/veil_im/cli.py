@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
-import os
-import socket
 import sys
 from pathlib import Path
 
@@ -12,6 +10,7 @@ from .config import default_paths
 from .crypto import ed25519_public_bytes, fingerprint, generate_ed25519_private_bytes
 from .models import Identity, VaultData
 from .network import NetworkNode
+from .runtime import harden_process
 from .tor import TorController, TorError
 from .tui import VeilTUI
 from .util import validate_username
@@ -61,6 +60,15 @@ def _cmd_init(args: argparse.Namespace) -> int:
 async def _run_async(args: argparse.Namespace) -> int:
     path = _vault_path(args.vault)
     temporary = bool(args.temporary)
+    hardening = harden_process()
+    if temporary and hardening.swap_active:
+        message = (
+            "ephemeral mode warning: active swap can retain sensitive process memory; "
+            "this mode is not forensic erasure"
+        )
+        if args.strict_ephemeral:
+            raise ValueError(message + "; disable swap or omit --strict-ephemeral")
+        print(f"Warning: {message}", file=sys.stderr)
     passphrase: str | None = None
 
     if temporary:
@@ -176,6 +184,14 @@ async def _doctor_async(args: argparse.Namespace) -> int:
     try:
         await tor.connect()
         print("ok")
+        try:
+            for item in await tor.audit():
+                marker = "WARN" if item.warning else ("OK" if item.ok else "FAIL")
+                print(f"  [{marker}] {item.name}: {item.detail}")
+                if not item.ok and not item.warning:
+                    failures += 1
+        except Exception as exc:
+            print(f"  [WARN] Tor hardening audit unavailable: {exc}")
     except Exception as exc:
         failures += 1
         print(f"failed ({exc})")
@@ -204,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="veil",
         description="Experimental encrypted terminal messenger over Tor onion services",
     )
-    parser.add_argument("--version", action="version", version="veil-im 0.1.1")
+    parser.add_argument("--version", action="version", version="veil-im 0.2.0")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create an encrypted persistent identity vault")
@@ -215,7 +231,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="start the terminal messenger")
     run.add_argument("--vault")
-    run.add_argument("--temporary", action="store_true")
+    run.add_argument("--temporary", "--ephemeral", dest="temporary", action="store_true")
+    run.add_argument(
+        "--strict-ephemeral",
+        action="store_true",
+        help="refuse ephemeral mode while Linux swap is active",
+    )
     run.add_argument("--username", help="required only for non-interactive temporary mode")
     run.add_argument("--virtual-port", type=int, default=9736)
     run.add_argument("--no-wait-publication", action="store_true")

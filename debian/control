@@ -23,8 +23,10 @@ Depends:
  python3-prompt-toolkit,
  python3-stem,
  tor
+Recommends:
+ qrencode
 Description: experimental encrypted terminal messenger over Tor
  Veil IM creates a terminal-based one-to-one messaging session using Tor v3
- onion services, authenticated application identities, and encrypted frames.
+ onion services, Noise XX transport encryption, Ed25519 application identities, and encrypted frames.
  .
  This package is an unaudited alpha and is not suitable for high-risk use.

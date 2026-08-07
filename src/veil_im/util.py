@@ -19,11 +19,38 @@ def b64u_encode(data: bytes) -> str:
 def b64u_decode(value: str) -> bytes:
     if not isinstance(value, str):
         raise TypeError("base64 value must be text")
+    if "=" in value or not re.fullmatch(r"[A-Za-z0-9_-]*", value):
+        raise ValueError("invalid unpadded base64url value")
     padding = "=" * ((4 - len(value) % 4) % 4)
     try:
-        return base64.urlsafe_b64decode(value + padding)
+        return base64.b64decode(
+            (value + padding).encode("ascii"), altchars=b"-_", validate=True
+        )
     except Exception as exc:  # binascii.Error differs across Python versions
         raise ValueError("invalid base64url value") from exc
+
+
+def strict_json_loads(value: str | bytes) -> Any:
+    """Decode JSON while rejecting duplicate object keys and NaN/Infinity."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str):
+        raise TypeError("JSON input must be text or UTF-8 bytes")
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = item
+        return result
+
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"non-finite JSON number is not allowed: {constant}")
+
+    return json.loads(
+        value, object_pairs_hook=object_pairs, parse_constant=reject_constant
+    )
 
 
 def canonical_json(value: Any) -> bytes:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import shutil
+import subprocess
 import time
 from collections.abc import Awaitable, Callable
 
@@ -50,6 +52,7 @@ def compact_onion(onion: str | None, width: int = 26) -> str:
 
 HELP_TEXT = """Commands:
   /invite                         show your shareable invite code
+  /qr                             render invite as terminal ASCII QR (qrencode)
   /add <invite> [alias]           save a peer in the encrypted contact book
   /connect <invite-or-alias>      connect through Tor
   /msg <peer> <text>              send a message
@@ -57,7 +60,7 @@ HELP_TEXT = """Commands:
   /accept <request-id> [alias]    approve unknown inbound peer; optional save
   /reject <request-id>            reject unknown inbound peer
   /contacts                       list saved contacts
-  /sessions                       list connected peers
+  /sessions                       list connected peers and unread counts
   /fingerprint                    show your identity fingerprint
   /help                           show this help
   /quit                           exit without writing message history
@@ -69,6 +72,7 @@ class VeilTUI:
         self.node = node
         self.persist = persist
         self.active_target: str | None = None
+        self.unread: dict[str, int] = {}
         self._lines: list[str] = []
         self._event_task: asyncio.Task[None] | None = None
 
@@ -209,9 +213,19 @@ class VeilTUI:
         except Exception:
             fp = "unavailable"
 
-        mode = "TEMP / RAM" if self.persist is None else "PERSISTENT"
+        mode = "EPHEMERAL" if self.persist is None else "PERSISTENT"
         onion = compact_onion(self.node.onion, 29)
         active = self.active_target or "none"
+
+        peer_rows: list[tuple[str, str]] = []
+        for session in list(self.node.sessions.values())[:6]:
+            peer_fp = short_fingerprint(session.peer.identity_key)
+            count = self.unread.get(peer_fp, 0)
+            marker = ">" if peer_fp == self.active_target else " "
+            suffix = f" ({count})" if count else ""
+            peer_rows.append(("class:sidebar.value", f"{marker} {session.peer.username[:12]}{suffix}\n"))
+        if not peer_rows:
+            peer_rows.append(("class:sidebar.key", "  none\n"))
 
         return [
             ("class:sidebar.heading", "IDENTITY\n"),
@@ -232,9 +246,13 @@ class VeilTUI:
             ("class:sidebar.key", "active     "),
             ("class:sidebar.value", f"{active}\n"),
             ("class:sidebar.key", "history    "),
-            ("class:sidebar.good", "RAM ONLY\n\n"),
-            ("class:sidebar.heading", "QUICK COMMANDS\n"),
-            ("class:sidebar.value", "/invite\n/connect <peer>\n/contacts\n/help"),
+            ("class:sidebar.good", "RAM ONLY\n"),
+            ("class:sidebar.key", "crypto     "),
+            ("class:sidebar.good", "NOISE XX / REKEY\n\n"),
+            ("class:sidebar.heading", "PEERS\n"),
+            *peer_rows,
+            ("class:sidebar.heading", "\nQUICK COMMANDS\n"),
+            ("class:sidebar.value", "/invite  /qr\n/connect <peer>\n/contacts\n/help"),
         ]
 
     def _append(self, text: str) -> None:
@@ -248,7 +266,7 @@ class VeilTUI:
         self.application.invalidate()
 
     async def run(self) -> None:
-        self._append("[SYS] VEIL node online | message history: RAM only")
+        self._append("[SYS] VEIL v0.2 node online | Noise XX | message history: RAM only")
         self._append("[TIP] /invite to share identity | /connect <invite-or-alias> to link")
         self._event_task = asyncio.create_task(self._event_loop())
         try:
@@ -273,16 +291,20 @@ class VeilTUI:
             elif isinstance(event, ConnectedEvent):
                 fp = short_fingerprint(event.peer.identity_key)
                 direction = "incoming" if event.inbound else "outgoing"
-                self.active_target = fp
+                if self.active_target is None:
+                    self.active_target = fp
+                self.unread.setdefault(fp, 0)
                 self._append(
                     f"[LINK] {direction} | {event.peer.username} [{fp}] | verify fingerprint out-of-band"
                 )
             elif isinstance(event, MessageEvent):
                 fp = short_fingerprint(event.peer.identity_key)
-                self.active_target = fp
+                if self.active_target != fp:
+                    self.unread[fp] = self.unread.get(fp, 0) + 1
                 self._append(f"[IN ] {event.peer.username} [{fp}] :: {event.body}")
             elif isinstance(event, DisconnectedEvent):
                 fp = short_fingerprint(event.peer.identity_key)
+                self.unread.pop(fp, None)
                 self._append(f"[OFF] {event.peer.username} [{fp}] | {event.reason}")
             elif isinstance(event, ErrorEvent):
                 self._append(f"[ERR] {event.message}")
@@ -319,6 +341,20 @@ class VeilTUI:
                     f"Invite code:\n{invite.encode()}\n"
                     "Share it through a separate channel and compare fingerprints."
                 )
+            elif command == "/qr":
+                executable = shutil.which("qrencode")
+                if executable is None:
+                    raise ValueError("qrencode is not installed; run: sudo apt install qrencode")
+                invite_text = self.node.invite().encode()
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [executable, "-t", "ASCII", "-m", "1"],
+                    input=invite_text,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                self._append("[QR ] scan this invite from a separate device/channel:\n" + result.stdout.rstrip())
             elif command == "/fingerprint":
                 public = self.node.invite().identity_key
                 self._append(f"identity fingerprint: {fingerprint(public)}")
@@ -339,8 +375,10 @@ class VeilTUI:
                 else:
                     rows = ["connected peers:"]
                     for session in sessions.values():
+                        fp = short_fingerprint(session.peer.identity_key)
+                        unread = self.unread.get(fp, 0)
                         rows.append(
-                            f"  {session.peer.username} [{short_fingerprint(session.peer.identity_key)}] {session.peer.onion}"
+                            f"  {session.peer.username} [{fp}] unread={unread} {session.peer.onion}"
                         )
                     self._append("\n".join(rows))
             elif command == "/add":
@@ -370,18 +408,21 @@ class VeilTUI:
                 self._append(f"[TOR] dialing {invite.username} through onion route...")
                 peer = await self.node.connect(invite)
                 self.active_target = short_fingerprint(peer.identity_key)
+                self.unread[self.active_target] = 0
             elif command == "/msg":
                 if len(args) < 2:
                     raise ValueError("usage: /msg <peer> <text>")
                 target, body = args[0], " ".join(args[1:])
                 peer = await self.node.send(target, body)
                 self.active_target = short_fingerprint(peer.identity_key)
+                self.unread[self.active_target] = 0
                 self._append(f"[YOU] -> {peer.username} :: {body}")
             elif command == "/use":
                 if len(args) != 1:
                     raise ValueError("usage: /use <peer>")
                 session = self.node._match_session(args[0])
                 self.active_target = short_fingerprint(session.peer.identity_key)
+                self.unread[self.active_target] = 0
                 self._append(f"active peer: {session.peer.username} [{self.active_target}]")
             elif command == "/accept":
                 if not (1 <= len(args) <= 2):

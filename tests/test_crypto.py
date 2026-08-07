@@ -1,18 +1,26 @@
 from __future__ import annotations
 
-import hashlib
+import pytest
+from cryptography.exceptions import InvalidSignature
 
-from veil_im.crypto import derive_session_keys, fingerprint, generate_x25519
+from veil_im.crypto import (
+    ed25519_public_bytes,
+    fingerprint,
+    generate_ed25519_private_bytes,
+    sign_identity_binding,
+    verify_identity_binding,
+)
 
 
-def test_x25519_hkdf_agrees() -> None:
-    left_private, left_public = generate_x25519()
-    right_private, right_public = generate_x25519()
-    transcript = hashlib.sha256(b"test transcript").digest()
-    left = derive_session_keys(left_private, right_public, transcript)
-    right = derive_session_keys(right_private, left_public, transcript)
-    assert left == right
-    assert left[0] != left[1]
+def test_identity_binding_signature_verifies_and_detects_tampering() -> None:
+    private = generate_ed25519_private_bytes()
+    public = ed25519_public_bytes(private)
+    payload = b"noise-static-key-binding"
+    signature = sign_identity_binding(private, payload)
+
+    verify_identity_binding(public, payload, signature)
+    with pytest.raises(InvalidSignature):
+        verify_identity_binding(public, payload + b"!", signature)
 
 
 def test_fingerprint_is_grouped_and_stable() -> None:

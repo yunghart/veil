@@ -5,14 +5,12 @@ import hashlib
 from dataclasses import dataclass
 
 from argon2.low_level import Type, hash_secret_raw
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from .util import b64u_encode
 
-DOMAIN_HELLO = b"veil-im/hello/v1\x00"
-DOMAIN_SESSION = b"veil-im/session/v1"
+DOMAIN_IDENTITY_BINDING = b"veil-im/noise-identity-binding/v2\x00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,42 +85,17 @@ def ed25519_public_bytes(private_raw: bytes) -> bytes:
     )
 
 
-def sign(private_raw: bytes, payload: bytes) -> bytes:
-    return ed25519_private_from_bytes(private_raw).sign(DOMAIN_HELLO + payload)
+def sign_identity_binding(private_raw: bytes, payload: bytes) -> bytes:
+    """Sign a Noise static-key/application-identity binding for protocol v2."""
+    return ed25519_private_from_bytes(private_raw).sign(DOMAIN_IDENTITY_BINDING + payload)
 
 
-def verify(public_raw: bytes, payload: bytes, signature: bytes) -> None:
+def verify_identity_binding(public_raw: bytes, payload: bytes, signature: bytes) -> None:
     if len(public_raw) != 32:
         raise ValueError("Ed25519 public key must be 32 bytes")
     ed25519.Ed25519PublicKey.from_public_bytes(public_raw).verify(
-        signature, DOMAIN_HELLO + payload
+        signature, DOMAIN_IDENTITY_BINDING + payload
     )
-
-
-def generate_x25519() -> tuple[x25519.X25519PrivateKey, bytes]:
-    private = x25519.X25519PrivateKey.generate()
-    public = private.public_key().public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-    return private, public
-
-
-def derive_session_keys(
-    private_key: x25519.X25519PrivateKey,
-    peer_public_raw: bytes,
-    transcript_hash: bytes,
-) -> tuple[bytes, bytes]:
-    if len(peer_public_raw) != 32:
-        raise ValueError("X25519 public key must be 32 bytes")
-    shared = private_key.exchange(x25519.X25519PublicKey.from_public_bytes(peer_public_raw))
-    material = HKDF(
-        algorithm=hashes.SHA256(),
-        length=64,
-        salt=transcript_hash,
-        info=DOMAIN_SESSION,
-    ).derive(shared)
-    return material[:32], material[32:]
 
 
 def fingerprint(public_key: bytes, groups: int = 8) -> str:

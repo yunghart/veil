@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 
 from .util import validate_onion
 

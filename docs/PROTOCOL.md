@@ -1,39 +1,146 @@
-# Veil wire protocol v1
+# Veil wire protocol v2
 
-This document describes the implemented MVP protocol, not a finalized standard.
+This document describes the implemented Veil 0.2 protocol. It is a development protocol, not a frozen standard.
 
-## Transport
+## Goals and non-goals
 
-TCP streams are carried to v3 onion services through Tor SOCKS5. The responder's onion service maps virtual port `9736` to a loopback-only TCP listener.
+The wire protocol aims to authenticate a Veil application identity, bind that identity to the contacted onion endpoint, establish fresh transport secrets, reject malformed state transitions, and encrypt one-to-one chat events. It does not provide offline delivery, group messaging, a Double Ratchet, post-compromise recovery, or complete traffic-analysis resistance.
 
-## Framing
+## Outer transport
 
-Every clear or encrypted protocol record is encoded as canonical UTF-8 JSON and prefixed with a four-byte unsigned big-endian length. Frames larger than 64 KiB are rejected.
+TCP streams travel to Tor v3 onion services through a SOCKS5 proxy. The responder creates an ephemeral onion service whose virtual port (default `9736`) maps to a loopback-only local TCP listener.
 
-## Handshake
+The `.onion` hostname is passed to Tor's SOCKS interface; Veil does not perform local DNS resolution for onion destinations.
 
-Each side owns a long-term Ed25519 signing key. For every connection, each side creates a fresh X25519 key pair and random 16-byte nonce.
+## Record framing
 
-The initiator sends a signed hello containing:
+Every Noise handshake message and Noise transport ciphertext is framed as:
 
-- protocol version and role
+```text
++----------------------+-------------------------+
+| uint16_be length (2) | payload (1..65535 bytes)|
++----------------------+-------------------------+
+```
+
+Zero-length, oversized, and truncated frames are rejected. This bound is also exercised by mutation/fuzz tests.
+
+## Noise suite
+
+Veil uses exactly:
+
+```text
+Noise_XX_25519_ChaChaPoly_SHA256
+```
+
+with prologue:
+
+```text
+veil-im/v2/noise-xx
+```
+
+The XX pattern is:
+
+```text
+-> e
+<- e, ee, s, es
+-> s, se
+```
+
+Veil's Noise implementation follows Noise revision 34 semantics and is tested against a published Cacophony vector committed under `tests/vectors/`. It remains unaudited application code.
+
+## Why two identity layers exist
+
+Noise XX authenticates Noise static X25519 keys. Veil's durable contact identity is instead an Ed25519 key stored in the encrypted vault and invite code.
+
+For every connection, Veil generates a fresh Noise static X25519 key. During the encrypted portions of XX, each peer sends an application identity object containing:
+
+- protocol version
+- role (`initiator` or `responder`)
 - display username
-- Ed25519 public key
-- ephemeral X25519 public key
-- random nonce
-- source onion and intended target onion
-- Unix timestamp
+- long-term Ed25519 public key
+- current Noise static X25519 public key
+- source onion
+- target onion
+- Ed25519 signature over the canonical unsigned object with a Veil v2 domain separator
 
-The responder verifies the signature, target onion, syntax, and optional contact policy. Its signed reply includes the corresponding fields plus the SHA-256 hash of the initiator frame. The initiator verifies the responder public key against the invite code and checks the onion bindings.
+The signature therefore binds the durable application identity to the Noise key and onion endpoints used for that session.
 
-Both sides calculate X25519 shared secret material and derive 64 bytes with HKDF-SHA256. The transcript hash is used as salt and protocol/domain strings are used as `info`. The first and second 32-byte halves are assigned by role as directional send keys.
+## Handshake flow
 
-## Message encryption
+### Message 1: initiator -> responder
 
-Each direction uses ChaCha20-Poly1305. Nonces are a fixed four-byte direction label followed by an unsigned 64-bit counter. Counters begin at zero and advance only after a successful operation. Associated data contains the transcript hash and direction label.
+Noise token: `e`.
 
-Encrypted plaintext is canonical JSON with message type, UUID, local timestamp, and UTF-8 body. TCP ordering plus strict counters causes reordered or replayed ciphertext to fail authentication.
+The Noise payload contains a strict canonical JSON `init` object with protocol version, source onion, and intended target onion. XX message 1 does not yet provide payload confidentiality; this data is already carried inside the Tor onion-service connection and becomes part of the Noise transcript.
 
-## Authentication meaning
+The responder rejects a target onion that does not match the onion service receiving the connection.
 
-The protocol proves that the peer controls the private key corresponding to the public key shown in the handshake. A username is not globally unique and is not proof of a person's real-world identity. Users should compare fingerprints through a separate trusted channel.
+### Message 2: responder -> initiator
+
+Noise tokens: `e, ee, s, es`.
+
+The encrypted payload contains the responder's signed Veil identity binding. The initiator verifies:
+
+- Noise state and ciphertext authentication
+- signed Ed25519 identity binding
+- binding to the responder's actual Noise static public key
+- source/target onion values
+- exact Ed25519 public key from the invite code
+
+A username is not used as an authentication credential.
+
+### Message 3: initiator -> responder
+
+Noise tokens: `s, se`.
+
+The encrypted payload contains the initiator's signed Veil identity binding. The responder performs equivalent syntax, signature, Noise-key, and onion checks.
+
+After the handshake, the responder applies the contact/approval policy. Unknown identities require explicit local user approval. Accepted/rejected authorization is itself sent through the encrypted Noise transport.
+
+## Transport cipher states
+
+Noise `Split()` produces independent sending and receiving ChaChaPoly cipher states. Nonces are the monotonically increasing Noise `uint64` nonce values. TCP ordering plus the Noise nonce state means replayed, omitted, corrupted, or reordered transport ciphertext does not silently become a valid later event.
+
+Veil calls Noise `REKEY()` independently on each direction every **1,024 successfully processed transport messages**.
+
+Important: Noise `REKEY()` updates the current symmetric key. It is **not** a Diffie-Hellman ratchet, does not continuously delete all recoverable message keys in Signal's sense, and does not provide post-compromise recovery.
+
+## Application event encoding and padding
+
+An encrypted application event is canonical UTF-8 JSON. Before Noise encryption it is wrapped as:
+
+```text
+uint16_be json_length || json || random_padding
+```
+
+The plaintext is padded to the smallest configured bucket that fits:
+
+```text
+256, 512, 1024, 2048, 4096, 8192, 16384 bytes
+```
+
+This prevents an observer at an endpoint from learning the exact application JSON length from every transport frame. It does not hide timing, message count, the selected bucket, or broader traffic patterns.
+
+Chat bodies are capped at 8 KiB of UTF-8 data. Decrypted events are strictly required to be JSON objects.
+
+## Channel binding
+
+Each `SecureSession` exposes the final Noise handshake hash as a hexadecimal channel-binding value. This is useful for tests/debugging and could later support an additional human safety-number UX. It is not currently presented as a standalone real-world identity proof.
+
+## Invite format
+
+Veil protocol v2 intentionally retains the `veil1:` invite serialization because the invite schema itself did not need to change. An invite carries:
+
+- display username
+- v3 onion address
+- long-term Ed25519 public key
+
+The invite's identity key and onion endpoint are pinned during outgoing authentication.
+
+## Failure behavior
+
+Malformed frames, invalid Noise state transitions, invalid signatures, mismatched identity/onion bindings, wrong invite identities, malformed encrypted events, timeouts, and rejected approval all terminate the relevant connection rather than downgrading authentication.
+
+## Version negotiation
+
+There is currently **no protocol negotiation or downgrade path**. Veil 0.2 speaks protocol v2 only. A v1 peer will fail rather than silently falling back to the retired custom handshake.

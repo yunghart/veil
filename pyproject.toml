@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "veil-im"
-version = "0.1.1"
+version = "0.2.0"
 description = "Experimental terminal messenger using authenticated encryption over Tor onion services"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "build>=1.2", "ruff>=0.8"]
+fuzz = ["atheris>=2.3"]
 
 [project.scripts]
 veil = "veil_im.cli:main"
